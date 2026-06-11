@@ -329,6 +329,7 @@ class Boltz2InferenceDataModule(pl.LightningDataModule):
         extra_mols_dir: Optional[Path] = None,
         override_method: Optional[str] = None,
         affinity: bool = False,
+        batch_size: int = 1,
     ) -> None:
         """Initialize the DataModule.
 
@@ -352,10 +353,16 @@ class Boltz2InferenceDataModule(pl.LightningDataModule):
             The path to the extra molecules directory.
         override_method : Optional[str]
             The method to override.
+        batch_size : int
+            The number of samples to fold per forward pass. Defaults to 1,
+            which reproduces the original single-sample behavior. Values > 1
+            pad the samples in a batch to a common length (see ``collate`` /
+            ``pad_to_max``) and fold them in a single forward pass.
 
         """
         super().__init__()
         self.num_workers = num_workers
+        self.batch_size = batch_size
         self.manifest = manifest
         self.target_dir = target_dir
         self.msa_dir = msa_dir
@@ -388,7 +395,7 @@ class Boltz2InferenceDataModule(pl.LightningDataModule):
         )
         return DataLoader(
             dataset,
-            batch_size=1,
+            batch_size=self.batch_size,
             num_workers=self.num_workers,
             pin_memory=True,
             shuffle=False,

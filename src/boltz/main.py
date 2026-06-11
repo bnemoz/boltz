@@ -911,6 +911,16 @@ def cli() -> None:
     default=2,
 )
 @click.option(
+    "--batch_size",
+    type=int,
+    help=(
+        "Number of inputs to fold per forward pass. Default is 1. Values > 1 "
+        "pad inputs in a batch to a common length and fold them together "
+        "(structure + confidence only; not supported with affinity)."
+    ),
+    default=1,
+)
+@click.option(
     "--override",
     is_flag=True,
     help="Whether to override existing found predictions. Default is False.",
@@ -1058,6 +1068,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     write_full_pde: bool = False,
     output_format: Literal["pdb", "mmcif"] = "mmcif",
     num_workers: int = 2,
+    batch_size: int = 1,
     override: bool = False,
     seed: Optional[int] = None,
     use_msa_server: bool = False,
@@ -1279,6 +1290,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
                 template_dir=processed.template_dir,
                 extra_mols_dir=processed.extra_mols_dir,
                 override_method=method,
+                batch_size=batch_size,
             )
         else:
             data_module = BoltzInferenceDataModule(
