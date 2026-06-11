@@ -17,6 +17,7 @@ class AttentionPairBias(nn.Module):
         num_heads: Optional[int] = None,
         inf: float = 1e6,
         compute_pair_bias: bool = True,
+        sdpa: bool = True,
     ) -> None:
         """Initialize the attention pair bias layer.
 
@@ -30,6 +31,15 @@ class AttentionPairBias(nn.Module):
             The number of heads.
         inf : float, optional
             The inf value, by default 1e6
+        compute_pair_bias : bool, optional
+            Whether to compute the pair bias from ``z`` or receive a
+            precomputed additive bias, by default True
+        sdpa : bool, optional
+            Whether to use ``torch.nn.functional.scaled_dot_product_attention``
+            instead of the hand-rolled einsum attention, by default True. The
+            SDPA path avoids materializing the full (B, H, N, N) score matrix
+            and is numerically equivalent (within tight tolerance) to the
+            einsum path when run in fp32.
 
         """
         super().__init__()
@@ -40,6 +50,7 @@ class AttentionPairBias(nn.Module):
         self.num_heads = num_heads
         self.head_dim = c_s // num_heads
         self.inf = inf
+        self.sdpa = sdpa
 
         self.proj_q = nn.Linear(c_s, c_s)
         self.proj_k = nn.Linear(c_s, c_s, bias=False)
@@ -96,15 +107,39 @@ class AttentionPairBias(nn.Module):
 
         g = self.proj_g(s).sigmoid()
 
-        with torch.autocast("cuda", enabled=False):
-            # Compute attention weights
-            attn = torch.einsum("bihd,bjhd->bhij", q.float(), k.float())
-            attn = attn / (self.head_dim**0.5) + bias.float()
-            attn = attn + (1 - mask[:, None, None].float()) * -self.inf
-            attn = attn.softmax(dim=-1)
+        if self.sdpa:
+            with torch.autocast("cuda", enabled=False):
+                v_dtype = v.dtype
+                # SDPA expects (B, H, N, D); q/k/v are currently (B, N, H, D).
+                q = q.transpose(1, 2).float()
+                k = k.transpose(1, 2).float()
+                v = v.transpose(1, 2).float()
 
-            # Compute output
-            o = torch.einsum("bhij,bjhd->bihd", attn, v.float()).to(v.dtype)
+                # Build the additive attn_mask of shape (B, H, N_q, N_k):
+                #   pair bias  +  padding term  (1 - mask) * -inf.
+                # bias is (B, H, N_q, N_k); the padding mask is over the key
+                # positions and is broadcast over the query axis. We use a large
+                # finite negative (-self.inf), not -inf, so a fully-masked row
+                # still produces a valid (uniform) softmax instead of NaNs.
+                attn_mask = bias.float()
+                pad = (1 - mask[:, None, None].float()) * -self.inf
+                attn_mask = attn_mask + pad
+
+                o = torch.nn.functional.scaled_dot_product_attention(
+                    q, k, v, attn_mask=attn_mask
+                )
+                # Back to (B, N, H, D), then flatten heads.
+                o = o.transpose(1, 2).to(v_dtype)
+        else:
+            with torch.autocast("cuda", enabled=False):
+                # Compute attention weights
+                attn = torch.einsum("bihd,bjhd->bhij", q.float(), k.float())
+                attn = attn / (self.head_dim**0.5) + bias.float()
+                attn = attn + (1 - mask[:, None, None].float()) * -self.inf
+                attn = attn.softmax(dim=-1)
+
+                # Compute output
+                o = torch.einsum("bhij,bjhd->bihd", attn, v.float()).to(v.dtype)
         o = o.reshape(B, -1, self.c_s)
         o = self.proj_o(g * o)
 
