@@ -1039,6 +1039,37 @@ def cli() -> None:
     is_flag=True,
     help=" to dump the s and z embeddings into a npz file. Default is False.",
 )
+@click.option(
+    "--compile/--no-compile",
+    "compile_model",
+    is_flag=True,
+    default=False,
+    help=(
+        "Whether to torch.compile the diffusion score network for faster "
+        "inference (Boltz-2 only). Combine with --pad_to_tokens/--pad_to_atoms "
+        "to avoid recompiles on varying input sizes. Default is off."
+    ),
+)
+@click.option(
+    "--pad_to_tokens",
+    type=int,
+    default=None,
+    help=(
+        "If set, pad every input to this fixed number of tokens so the "
+        "(compiled) model sees stable shapes. Must be >= the largest input "
+        "token count in the run. Default None (no fixed padding)."
+    ),
+)
+@click.option(
+    "--pad_to_atoms",
+    type=int,
+    default=None,
+    help=(
+        "If set, pad every input to this fixed number of atoms (rounded up to "
+        "a multiple of the atom window size). Must be >= the largest input "
+        "atom count in the run. Default None (no fixed padding)."
+    ),
+)
 def predict(  # noqa: C901, PLR0915, PLR0912
     data: str,
     out_dir: str,
@@ -1077,6 +1108,9 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     num_subsampled_msa: int = 1024,
     no_kernels: bool = False,
     write_embeddings: bool = False,
+    compile_model: bool = False,
+    pad_to_tokens: Optional[int] = None,
+    pad_to_atoms: Optional[int] = None,
 ) -> None:
     """Run predictions with Boltz."""
     # If cpu, write a friendly warning
@@ -1155,6 +1189,12 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             method_names = list(const.method_types_ids.keys())
             msg = f"Method {method} not supported. Supported: {method_names}"
             raise ValueError(msg)
+
+    # torch.compile of the score network is only wired for Boltz-2.
+    if compile_model and model != "boltz2":
+        msg = "--compile is only supported for Boltz-2; ignoring for boltz1."
+        click.echo(msg)
+        compile_model = False
 
     # Process inputs
     ccd_path = cache / "ccd.pkl"
@@ -1279,6 +1319,8 @@ def predict(  # noqa: C901, PLR0915, PLR0912
                 template_dir=processed.template_dir,
                 extra_mols_dir=processed.extra_mols_dir,
                 override_method=method,
+                pad_to_tokens=pad_to_tokens,
+                pad_to_atoms=pad_to_atoms,
             )
         else:
             data_module = BoltzInferenceDataModule(
@@ -1311,6 +1353,11 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         steering_args.physical_guidance_update = use_potentials
 
         model_cls = Boltz2 if model == "boltz2" else Boltz1
+        extra_load_args = {}
+        if model == "boltz2" and compile_model:
+            # Compile the diffusion score network. Pair with --pad_to_tokens/
+            # --pad_to_atoms to compile once instead of per input size.
+            extra_load_args["compile_structure"] = True
         model_module = model_cls.load_from_checkpoint(
             checkpoint,
             strict=True,
@@ -1322,6 +1369,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             pairformer_args=asdict(pairformer_args),
             msa_args=asdict(msa_args),
             steering_args=asdict(steering_args),
+            **extra_load_args,
         )
         model_module.eval()
 

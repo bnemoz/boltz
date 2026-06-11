@@ -168,6 +168,8 @@ class PredictionDataset(torch.utils.data.Dataset):
         extra_mols_dir: Optional[Path] = None,
         override_method: Optional[str] = None,
         affinity: bool = False,
+        pad_to_tokens: Optional[int] = None,
+        pad_to_atoms: Optional[int] = None,
     ) -> None:
         """Initialize the training dataset.
 
@@ -185,6 +187,14 @@ class PredictionDataset(torch.utils.data.Dataset):
             The path to the constraints directory.
         template_dir : Optional[Path]
             The path to the template directory.
+        pad_to_tokens : Optional[int]
+            If set, pad every sample to this fixed number of tokens. Must be
+            >= the largest input. Used to give the (compiled) model stable
+            input shapes. Default None (no fixed padding).
+        pad_to_atoms : Optional[int]
+            If set, pad every sample to this fixed number of atoms. Must be
+            >= the largest input. Rounded up to a multiple of the atom window
+            size internally. Default None (no fixed padding).
 
         """
         super().__init__()
@@ -200,6 +210,8 @@ class PredictionDataset(torch.utils.data.Dataset):
         self.extra_mols_dir = extra_mols_dir
         self.override_method = override_method
         self.affinity = affinity
+        self.pad_to_tokens = pad_to_tokens
+        self.pad_to_atoms = pad_to_atoms
         if self.affinity:
             self.cropper = AffinityCropper()
 
@@ -272,6 +284,17 @@ class PredictionDataset(torch.utils.data.Dataset):
         seed = 42
         random = np.random.default_rng(seed)
 
+        # Resolve fixed-shape padding targets (opt-in). max_atoms must be a
+        # multiple of the atom window size, so round up if needed.
+        max_tokens = self.pad_to_tokens
+        max_atoms = self.pad_to_atoms
+        if max_atoms is not None:
+            atoms_per_window_queries = 32
+            max_atoms = (
+                (max_atoms + atoms_per_window_queries - 1)
+                // atoms_per_window_queries
+            ) * atoms_per_window_queries
+
         # Compute features
         try:
             features = self.featurizer.process(
@@ -279,8 +302,8 @@ class PredictionDataset(torch.utils.data.Dataset):
                 molecules=molecules,
                 random=random,
                 training=False,
-                max_atoms=None,
-                max_tokens=None,
+                max_atoms=max_atoms,
+                max_tokens=max_tokens,
                 max_seqs=const.max_msa_seqs,
                 pad_to_max_seqs=False,
                 single_sequence_prop=0.0,
@@ -329,6 +352,8 @@ class Boltz2InferenceDataModule(pl.LightningDataModule):
         extra_mols_dir: Optional[Path] = None,
         override_method: Optional[str] = None,
         affinity: bool = False,
+        pad_to_tokens: Optional[int] = None,
+        pad_to_atoms: Optional[int] = None,
     ) -> None:
         """Initialize the DataModule.
 
@@ -365,6 +390,8 @@ class Boltz2InferenceDataModule(pl.LightningDataModule):
         self.extra_mols_dir = extra_mols_dir
         self.override_method = override_method
         self.affinity = affinity
+        self.pad_to_tokens = pad_to_tokens
+        self.pad_to_atoms = pad_to_atoms
 
     def predict_dataloader(self) -> DataLoader:
         """Get the training dataloader.
@@ -385,6 +412,8 @@ class Boltz2InferenceDataModule(pl.LightningDataModule):
             extra_mols_dir=self.extra_mols_dir,
             override_method=self.override_method,
             affinity=self.affinity,
+            pad_to_tokens=self.pad_to_tokens,
+            pad_to_atoms=self.pad_to_atoms,
         )
         return DataLoader(
             dataset,
