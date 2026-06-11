@@ -1039,6 +1039,28 @@ def cli() -> None:
     is_flag=True,
     help=" to dump the s and z embeddings into a npz file. Default is False.",
 )
+@click.option(
+    "--compile/--no-compile",
+    "compile_models",
+    is_flag=True,
+    default=False,
+    help=(
+        "Whether to torch.compile the model (pairformer, structure, and "
+        "confidence modules). Speeds up high-throughput runs that reuse a "
+        "single loaded model, at the cost of an up-front compilation. "
+        "Default is False."
+    ),
+)
+@click.option(
+    "--batch_size",
+    type=int,
+    default=1,
+    help=(
+        "The inference batch size. Default is 1, which preserves the "
+        "standard behavior. Values greater than 1 also require the "
+        "opt/batch-inference changes to be correct end-to-end."
+    ),
+)
 def predict(  # noqa: C901, PLR0915, PLR0912
     data: str,
     out_dir: str,
@@ -1077,6 +1099,8 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     num_subsampled_msa: int = 1024,
     no_kernels: bool = False,
     write_embeddings: bool = False,
+    compile_models: bool = False,
+    batch_size: int = 1,
 ) -> None:
     """Run predictions with Boltz."""
     # If cpu, write a friendly warning
@@ -1279,6 +1303,9 @@ def predict(  # noqa: C901, PLR0915, PLR0912
                 template_dir=processed.template_dir,
                 extra_mols_dir=processed.extra_mols_dir,
                 override_method=method,
+                # NOTE: batch_size > 1 also requires the opt/batch-inference
+                # changes (writer/mask/assertions) to be correct end-to-end.
+                batch_size=batch_size,
             )
         else:
             data_module = BoltzInferenceDataModule(
@@ -1287,6 +1314,9 @@ def predict(  # noqa: C901, PLR0915, PLR0912
                 msa_dir=processed.msa_dir,
                 num_workers=num_workers,
                 constraints_dir=processed.constraints_dir,
+                # NOTE: batch_size > 1 also requires the opt/batch-inference
+                # changes (writer/mask/assertions) to be correct end-to-end.
+                batch_size=batch_size,
             )
 
         # Load model
@@ -1311,6 +1341,19 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         steering_args.physical_guidance_update = use_potentials
 
         model_cls = Boltz2 if model == "boltz2" else Boltz1
+
+        # Optionally torch.compile the model. These are existing Boltz2/Boltz1
+        # __init__ args (and saved hparams), so passing them as kwargs to
+        # load_from_checkpoint overrides the checkpoint defaults. Both boltz1
+        # and boltz2 accept all three, so the same kwargs are safe for either.
+        compile_kwargs = {}
+        if compile_models:
+            compile_kwargs = {
+                "compile_structure": True,
+                "compile_pairformer": True,
+                "compile_confidence": True,
+            }
+
         model_module = model_cls.load_from_checkpoint(
             checkpoint,
             strict=True,
@@ -1322,6 +1365,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             pairformer_args=asdict(pairformer_args),
             msa_args=asdict(msa_args),
             steering_args=asdict(steering_args),
+            **compile_kwargs,
         )
         model_module.eval()
 
