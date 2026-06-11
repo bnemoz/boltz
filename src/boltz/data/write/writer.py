@@ -63,23 +63,45 @@ class BoltzWriter(BasePredictionWriter):
 
         # Get the records
         records: list[Record] = batch["record"]
+        num_records = len(records)
 
-        # Get the predictions
+        # Get the predictions.
+        #
+        # The structure / confidence modules interleave the batch and the
+        # diffusion-sample (multiplicity) dimensions: the leading dimension of
+        # ``coords`` and of every per-sample metric is ``B * diffusion_samples``
+        # ordered as [rec0_s0, rec0_s1, ..., rec1_s0, rec1_s1, ...]. We reshape
+        # ``coords`` to (B, diffusion_samples, L, 3) so we can iterate per record,
+        # and recover ``diffusion_samples`` to slice the flat metric tensors below.
         coords = prediction["coords"]
-        coords = coords.unsqueeze(0)
+        diffusion_samples = coords.shape[0] // num_records
+        coords = coords.reshape(
+            num_records, diffusion_samples, *coords.shape[1:]
+        )
 
+        # ``masks`` (atom_pad_mask) carries one mask per record (shape (B, L)),
+        # i.e. it is NOT expanded by diffusion_samples.
         pad_masks = prediction["masks"]
 
-        # Get ranking
-        if "confidence_score" in prediction:
-            argsort = torch.argsort(prediction["confidence_score"], descending=True)
-            idx_to_rank = {idx.item(): rank for rank, idx in enumerate(argsort)}
-        # Handles cases where confidence summary is False
-        else:
-            idx_to_rank = {i: i for i in range(len(records))}
-
         # Iterate over the records
-        for record, coord, pad_mask in zip(records, coords, pad_masks):
+        for record_idx, (record, coord, pad_mask) in enumerate(
+            zip(records, coords, pad_masks)
+        ):
+            # Offset into the flat (B * diffusion_samples) metric tensors for
+            # this record's diffusion samples.
+            sample_offset = record_idx * diffusion_samples
+
+            # Get ranking, computed per record over its own diffusion samples.
+            if "confidence_score" in prediction:
+                record_scores = prediction["confidence_score"][
+                    sample_offset : sample_offset + diffusion_samples
+                ]
+                argsort = torch.argsort(record_scores, descending=True)
+                idx_to_rank = {idx.item(): rank for rank, idx in enumerate(argsort)}
+            # Handles cases where confidence summary is False
+            else:
+                idx_to_rank = {i: i for i in range(diffusion_samples)}
+
             # Load the structure
             path = self.data_dir / f"{record.id}.npz"
             if self.boltz2:
@@ -97,6 +119,11 @@ class BoltzWriter(BasePredictionWriter):
             structure = structure.remove_invalid_chains()
 
             for model_idx in range(coord.shape[0]):
+                # Index into the flat (B * diffusion_samples) metric tensors for
+                # this record's ``model_idx``-th diffusion sample. For B == 1
+                # this equals ``model_idx`` exactly, preserving prior behavior.
+                flat_idx = sample_offset + model_idx
+
                 # Get model coord
                 model_coord = coord[model_idx]
                 # Unpad
@@ -153,7 +180,7 @@ class BoltzWriter(BasePredictionWriter):
                 # Get plddt's
                 plddts = None
                 if "plddt" in prediction:
-                    plddts = prediction["plddt"][model_idx]
+                    plddts = prediction["plddt"][flat_idx]
 
                 # Create path name
                 outname = f"{record.id}_model_{idx_to_rank[model_idx]}"
@@ -198,15 +225,15 @@ class BoltzWriter(BasePredictionWriter):
                         "complex_pde",
                         "complex_ipde",
                     ]:
-                        confidence_summary_dict[key] = prediction[key][model_idx].item()
+                        confidence_summary_dict[key] = prediction[key][flat_idx].item()
                     confidence_summary_dict["chains_ptm"] = {
-                        idx: prediction["pair_chains_iptm"][idx][idx][model_idx].item()
+                        idx: prediction["pair_chains_iptm"][idx][idx][flat_idx].item()
                         for idx in prediction["pair_chains_iptm"]
                     }
                     confidence_summary_dict["pair_chains_iptm"] = {
                         idx1: {
                             idx2: prediction["pair_chains_iptm"][idx1][idx2][
-                                model_idx
+                                flat_idx
                             ].item()
                             for idx2 in prediction["pair_chains_iptm"][idx1]
                         }
@@ -221,7 +248,7 @@ class BoltzWriter(BasePredictionWriter):
                         )
 
                     # Save plddt
-                    plddt = prediction["plddt"][model_idx]
+                    plddt = prediction["plddt"][flat_idx]
                     path = (
                         struct_dir
                         / f"plddt_{record.id}_model_{idx_to_rank[model_idx]}.npz"
@@ -230,7 +257,7 @@ class BoltzWriter(BasePredictionWriter):
 
                 # Save pae
                 if "pae" in prediction:
-                    pae = prediction["pae"][model_idx]
+                    pae = prediction["pae"][flat_idx]
                     path = (
                         struct_dir
                         / f"pae_{record.id}_model_{idx_to_rank[model_idx]}.npz"
@@ -239,17 +266,20 @@ class BoltzWriter(BasePredictionWriter):
 
                 # Save pde
                 if "pde" in prediction:
-                    pde = prediction["pde"][model_idx]
+                    pde = prediction["pde"][flat_idx]
                     path = (
                         struct_dir
                         / f"pde_{record.id}_model_{idx_to_rank[model_idx]}.npz"
                     )
                     np.savez_compressed(path, pde=pde.cpu().numpy())
                 
-            # Save embeddings
+            # Save embeddings. ``s``/``z`` come from the trunk and are NOT
+            # expanded by diffusion_samples, so their leading dimension is the
+            # batch dimension. Slice this record's embedding while preserving
+            # the original leading singleton dimension (B == 1 stays identical).
             if self.write_embeddings and "s" in prediction and "z" in prediction:
-                s = prediction["s"].cpu().numpy()
-                z = prediction["z"].cpu().numpy()
+                s = prediction["s"][record_idx : record_idx + 1].cpu().numpy()
+                z = prediction["z"][record_idx : record_idx + 1].cpu().numpy()
 
                 path = (
                     struct_dir
