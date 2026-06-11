@@ -1057,13 +1057,19 @@ class Boltz2(LightningModule):
 
     def predict_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0) -> dict:
         try:
+            # The sequential confidence path saves memory by looping over diffusion
+            # samples, but only supports batch_size == 1 (asserts z.shape[0] == 1 in
+            # ConfidenceModule). For B > 1 we use the parallel path, which threads the
+            # batch dim and masks throughout. B == 1 keeps the original sequential path
+            # so its behaviour is unchanged.
+            batch_size = batch["token_pad_mask"].shape[0]
             out = self(
                 batch,
                 recycling_steps=self.predict_args["recycling_steps"],
                 num_sampling_steps=self.predict_args["sampling_steps"],
                 diffusion_samples=self.predict_args["diffusion_samples"],
                 max_parallel_samples=self.predict_args["max_parallel_samples"],
-                run_confidence_sequentially=True,
+                run_confidence_sequentially=(batch_size == 1),
             )
             pred_dict = {"exception": False}
             if "keys_dict_batch" in self.predict_args:

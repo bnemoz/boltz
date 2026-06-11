@@ -384,3 +384,44 @@ def test_writer_b1_confidence_ranking(monkeypatch, tmp_path):
         "r1_model_0.cif",
         "r1_model_1.cif",
     ]
+
+
+def test_predict_step_confidence_path_depends_on_batch_size(monkeypatch):
+    """predict_step must use the memory-saving sequential confidence path only for
+    B == 1 (where ConfidenceModule asserts z.shape[0] == 1), and the parallel path
+    for B > 1. B == 1 behaviour stays identical to before the batching change."""
+    import torch
+
+    from boltz.model.models.boltz2 import Boltz2
+
+    captured = {}
+
+    def fake_call(self, batch, **kwargs):  # stands in for the full model forward
+        captured["run_confidence_sequentially"] = kwargs["run_confidence_sequentially"]
+        b = batch["token_pad_mask"].shape[0]
+        return {
+            "sample_atom_coords": torch.zeros(b, 1, 3),
+            "s": torch.zeros(b, 1, 1),
+            "z": torch.zeros(b, 1, 1, 1),
+        }
+
+    monkeypatch.setattr(Boltz2, "__call__", fake_call, raising=False)
+
+    fake = object.__new__(Boltz2)  # skip nn.Module.__init__ (no weights needed)
+    fake.predict_args = {
+        "recycling_steps": 0,
+        "sampling_steps": 1,
+        "diffusion_samples": 1,
+        "max_parallel_samples": 1,
+    }
+    fake.confidence_prediction = False  # skip confidence-key plumbing
+    fake.affinity_prediction = False
+
+    for b, expected_sequential in [(1, True), (4, False)]:
+        batch = {
+            "token_pad_mask": torch.ones(b, 5),
+            "atom_pad_mask": torch.ones(b, 7),
+        }
+        out = Boltz2.predict_step(fake, batch, 0)
+        assert out["exception"] is False
+        assert captured["run_confidence_sequentially"] is expected_sequential
